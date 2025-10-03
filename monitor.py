@@ -10,6 +10,7 @@ from collections import deque, defaultdict
 from urllib.parse import urlparse
 from deepdiff import DeepDiff
 from .connection import CDPConnection
+from .webrtcprivacy import configure_webrtc_privacy
 from typing import Optional, Dict, Any, List
 
 class EventDrivenMonitor:
@@ -49,7 +50,7 @@ class EventDrivenMonitor:
             await self.conn.disconnect()
 
     async def _interactive_loop(self):
-        print("\nCommands:\n  run [prefix] - Start or resume logging.\n  wait         - Pause logging.\n  new [prefix] - Create a new log file and start.\n  quit         - Exit.")
+        print("\nCommands:\n  run [prefix] - Start or resume logging.\n  wait         - Pause logging.\n  new [prefix] - Create a new log file and start.\n  connect <port> - Connect to a different CDP port.\n  privacy      - Configure Brave WebRTC privacy settings.\n  quit         - Exit.")
         while True:
             command_str = await asyncio.to_thread(input, "\n> ")
             parts = command_str.lower().strip().split()
@@ -69,10 +70,60 @@ class EventDrivenMonitor:
                 self._start_new_log_file(prefix)
                 await self._ensure_listeners()
                 print(f"New log file created. Saving to: {self.log_file_path}")
+            elif command == "connect":
+                if not args or not args[0].isdigit():
+                    print("Usage: connect <port>")
+                else:
+                    await self._reconnect(int(args[0]))
+            elif command == "privacy":
+                await self._configure_privacy()
             elif command == "quit":
                 break
             else:
                 print("Unknown command.")
+
+    async def _configure_privacy(self):
+        """Configure Brave WebRTC privacy settings."""
+        print("\nConfiguring Brave WebRTC privacy...")
+        success = await configure_webrtc_privacy(self.conn.page, restore_url=True)
+        if success:
+            print("WebRTC privacy configuration successful!")
+        else:
+            print("WebRTC privacy configuration failed. Make sure you're using Brave browser.")
+
+    async def _reconnect(self, new_port: int):
+        """Reconnect to a different CDP port."""
+        print(f"\nDisconnecting from port {self.conn.cdp_port}...")
+        
+        # Pause logging during reconnection
+        was_logging = self.is_logging
+        self.is_logging = False
+        
+        # Disconnect from current port
+        await self.conn.disconnect()
+        
+        # Reset listener state
+        self._listeners_attached = False
+        self._navigation_listener_active = False
+        self._main_frame_id = None
+        
+        # Create new connection
+        self.conn = CDPConnection(cdp_port=new_port)
+        print(f"Connecting to port {new_port}...")
+        
+        if await self.conn.connect():
+            page_title = await self.conn.page.title()
+            page_url = self.conn.page.url
+            print(f"Successfully connected to: {page_title}")
+            print(f"Current URL: {page_url}")
+            
+            # Resume logging if it was active
+            if was_logging:
+                self.is_logging = True
+                await self._ensure_listeners()
+                print(f"Logging resumed.")
+        else:
+            print(f"Failed to connect to port {new_port}")
 
     def _start_new_log_file(self, prefix: str = None):
         self.log_file_path = self._get_log_path(prefix)
