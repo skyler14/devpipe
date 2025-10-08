@@ -1,7 +1,7 @@
 """
 devpipe - Interactive browser monitoring and debugging toolkit
 """
-from setuptools import setup, find_packages
+from setuptools import setup
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -15,7 +15,9 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/skyler14/devpipe",
-    packages=find_packages(),
+    # Treat current directory as the devpipe package
+    packages=['devpipe'],
+    package_dir={'devpipe': '.'},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

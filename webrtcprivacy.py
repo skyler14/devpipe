@@ -1,5 +1,5 @@
 """
-WebRTC Privacy Module - Simple one-liner to configure Brave WebRTC IP handling policy.
+WebRTC Privacy Module - Configure WebRTC IP handling policy (Brave browser only).
 Usage: await configure_webrtc_privacy(page)
 """
 import asyncio
@@ -13,10 +13,34 @@ WEBRTC_POLICY_TEXT_LABEL = "WebRTC IP handling policy"
 TARGET_OPTION_VALUE = "disable_non_proxied_udp"
 
 
+async def detect_browser_type(page: Page) -> str:
+    """
+    Detect browser type from user agent.
+    
+    Returns:
+        str: 'brave', 'chrome', 'firefox', or 'unknown'
+    """
+    try:
+        user_agent = await page.evaluate("navigator.userAgent")
+        
+        if "Brave" in user_agent or "brave" in user_agent.lower():
+            return "brave"
+        elif "Firefox" in user_agent:
+            return "firefox"
+        elif "Chrome" in user_agent or "Chromium" in user_agent:
+            return "chrome"
+        else:
+            return "unknown"
+    except Exception:
+        return "unknown"
+
+
 async def configure_webrtc_privacy(page: Page, restore_url: bool = True) -> bool:
     """
     Configure Brave browser to use 'disable_non_proxied_udp' for WebRTC IP handling.
     This prevents WebRTC from leaking your real IP when using a proxy.
+    
+    **Brave Browser Only** - Chrome and Firefox not currently supported.
     
     Args:
         page: Playwright Page object (must be Brave browser)
@@ -29,6 +53,17 @@ async def configure_webrtc_privacy(page: Page, restore_url: bool = True) -> bool
         await configure_webrtc_privacy(page)
     """
     original_url = page.url
+    
+    # Browser detection
+    browser_type = await detect_browser_type(page)
+    
+    if browser_type != "brave":
+        logger.warning(
+            f"WebRTC privacy configuration is Brave-only. "
+            f"Detected browser: {browser_type}. "
+            f"Chrome requires extensions, Firefox uses about:config (not yet supported)."
+        )
+        return False
     
     try:
         logger.info("Configuring Brave WebRTC IP handling policy...")
