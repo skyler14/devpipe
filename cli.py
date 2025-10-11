@@ -18,10 +18,16 @@ def main():
         help='The CDP port of the target browser instance.'
     )
     
+    parser.add_argument(
+        '--track-all-tabs',
+        action='store_true',
+        help='Automatically track all tabs and pop-ups (attaches listeners to new tabs as they open).'
+    )
+    
     args = parser.parse_args()
 
     async def run():
-        monitor = EventDrivenMonitor(cdp_port=args.port)
+        monitor = EventDrivenMonitor(cdp_port=args.port, track_all_tabs=args.track_all_tabs)
         await monitor.start()
 
     try:

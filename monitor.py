@@ -1,6 +1,6 @@
 """
 The core event-driven, interactive monitoring session for dev_utils.
-Includes network deduplication and a resilient, rate-limited UI click scanner.
+Includes network deduplication, multi-tab tracking, and a resilient, rate-limited UI click scanner.
 """
 import asyncio
 import json
@@ -11,71 +11,206 @@ from urllib.parse import urlparse
 from deepdiff import DeepDiff
 from .connection import CDPConnection
 from .webrtcprivacy import configure_webrtc_privacy
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
+
+class PageTracker:
+    """Tracks a single page/tab with its associated CDP session and listeners."""
+    
+    def __init__(self, page, client, page_id: str, monitor: 'EventDrivenMonitor'):
+        self.page = page
+        self.client = client
+        self.page_id = page_id
+        self.monitor = monitor
+        self.listeners_attached = False
+        self.navigation_listener_active = False
+        self.main_frame_id = None
+        
+    async def attach_listeners(self):
+        """Attach all event listeners to this page."""
+        if self.listeners_attached:
+            return
+            
+        try:
+            # Enable Runtime FIRST so console listener is ready
+            await self.client.send('Runtime.enable')
+            self.client.on('Runtime.consoleAPICalled', self._handle_console_api)
+            
+            # Enable Network monitoring
+            self.client.on('Network.requestWillBeSent', self._handle_network_request)
+            await self.client.send('Network.enable')
+            
+            # Enable Page domain for navigation events
+            await self.client.send('Page.enable')
+            
+            # Get the main frame ID
+            frame_tree = await self.client.send('Page.getFrameTree')
+            self.main_frame_id = frame_tree.get('frameTree', {}).get('frame', {}).get('id')
+            
+            # Set up navigation listener to re-inject script
+            if not self.navigation_listener_active:
+                self.client.on('Page.frameNavigated', self._handle_navigation)
+                self.navigation_listener_active = True
+            
+            # Check current page URL
+            current_url = self.page.url
+            if current_url.startswith('chrome://') or current_url.startswith('chrome-extension://'):
+                print(f"\n[Tab {self.page_id}] WARNING: Current page is '{current_url}'")
+                print("Chrome internal pages block script injection. Click detection will NOT work.")
+                self.listeners_attached = True
+                return
+            
+            # Inject click scanner script
+            await self._inject_scanner()
+            
+            self.listeners_attached = True
+            print(f"[Tab {self.page_id}] Event listeners attached and ready.")
+            
+        except Exception as e:
+            print(f"[Tab {self.page_id}] Failed to attach listeners: {e}")
+
+    async def _inject_scanner(self):
+        """Inject the click scanner script into the current page."""
+        try:
+            await self.page.evaluate(self.monitor._get_click_scanner_script())
+            
+            # Send a test message to verify the script is running
+            test_result = await self.page.evaluate("""
+                (() => {
+                    console.log('__UI_SCANNER_TEST__');
+                    return 'Script injected successfully';
+                })()
+            """)
+            print(f"[Tab {self.page_id}] Script injection: {test_result}")
+            
+        except Exception as e:
+            print(f"[Tab {self.page_id}] ERROR: Failed to inject click scanner script: {e}")
+
+    async def _handle_navigation(self, event: dict):
+        """Re-inject the scanner script when the page navigates."""
+        frame_id = event.get('frame', {}).get('id')
+        parent_id = event.get('frame', {}).get('parentId')
+        url = event.get('frame', {}).get('url', '')
+        
+        # Only re-inject on main frame navigation
+        is_main_frame = (parent_id is None) or (frame_id == self.main_frame_id)
+        
+        if is_main_frame:
+            print(f"\n[Tab {self.page_id}] Page navigated to: {url}")
+            
+            if not url.startswith('chrome://') and not url.startswith('chrome-extension://'):
+                # Wait a bit for the page to settle
+                await asyncio.sleep(0.5)
+                await self._inject_scanner()
+                self.monitor._log_event("PAGE_NAVIGATION", {"url": url, "tab_id": self.page_id})
+
+    def _handle_network_request(self, event: dict):
+        # Add tab_id to the event
+        event['tab_id'] = self.page_id
+        self.monitor._network_deduplicator.process(event)
+
+    def _handle_console_api(self, event):
+        try:
+            if 'args' in event and len(event['args']) > 0:
+                first_arg = event['args'][0]
+                if 'value' in first_arg:
+                    value = first_arg['value']
+                    
+                    # Debug: log the test message
+                    if value == '__UI_SCANNER_TEST__':
+                        print(f"[Tab {self.page_id}] Click scanner script is running!")
+                        return
+                    
+                    # Handle actual click data
+                    if value.startswith('__UI_SCANNER_DATA__'):
+                        now = datetime.now()
+                        if now - self.monitor._last_log_time < self.monitor.MICRO_DEBOUNCE_WINDOW:
+                            return
+                        while self.monitor._ui_click_timestamps and \
+                              self.monitor._ui_click_timestamps[0] < now - self.monitor.RATE_LIMIT_WINDOW:
+                            self.monitor._ui_click_timestamps.popleft()
+                        if len(self.monitor._ui_click_timestamps) >= self.monitor.RATE_LIMIT_COUNT:
+                            return
+                        self.monitor._ui_click_timestamps.append(now)
+                        self.monitor._last_log_time = now
+                        data = json.loads(value.replace('__UI_SCANNER_DATA__', ''))
+                        data['tab_id'] = self.page_id
+                        self.monitor._log_event('UI_CLICK', data)
+                        print(f"[Tab {self.page_id}] Click detected: {data.get('element_path', 'unknown')}")
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            pass
+
 
 class EventDrivenMonitor:
-    """Manages an interactive, event-driven monitoring session with a hard rate limit on UI events."""
+    """Manages an interactive, event-driven monitoring session with multi-tab support."""
 
     RATE_LIMIT_COUNT = 3
     RATE_LIMIT_WINDOW = timedelta(seconds=1)
     MICRO_DEBOUNCE_WINDOW = timedelta(milliseconds=200)
 
-    def __init__(self, cdp_port: int):
+    def __init__(self, cdp_port: int, track_all_tabs: bool = False):
         self.conn = CDPConnection(cdp_port=cdp_port)
+        self.track_all_tabs = track_all_tabs
         self.is_logging = False
         self.log_file_path: Optional[Path] = None
         self._event_queue = asyncio.Queue()
         self._log_writer_task: Optional[asyncio.Task] = None
         self.log_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._network_deduplicator = NetworkDeduplicator(self._log_event)
-        self._listeners_attached = False
         self._ui_click_timestamps = deque()
         self._last_log_time = datetime.min
-        self._navigation_listener_active = False
-        self._main_frame_id = None
+        
+        # Multi-tab tracking
+        self._page_trackers: Dict[str, PageTracker] = {}
+        self._page_listener_active = False
 
     async def start(self):
         print(f"Connecting to browser on CDP port {self.conn.cdp_port}...")
-        if not await self.conn.connect(): return
+        if self.track_all_tabs:
+            print("Multi-tab tracking enabled: will monitor all tabs and pop-ups")
+        
+        if not await self.conn.connect():
+            return
         
         # Handle race condition where page might be navigating during connection
         try:
             page_title = await self.conn.page.title()
             page_url = self.conn.page.url
         except Exception as e:
-            # Page might be navigating, wait a moment and retry
             print(f"Initial connection issue (page may be navigating), retrying...")
             await asyncio.sleep(1)
             try:
                 page_title = await self.conn.page.title()
                 page_url = self.conn.page.url
             except Exception as e:
-                # If still failing, use generic info
                 page_title = "Unknown"
                 page_url = "unknown"
                 print(f"Warning: Could not get page info: {e}")
         
         print(f"Successfully connected to: {page_title}")
         print(f"Current URL: {page_url}")
+        
         try:
             await self._interactive_loop()
         finally:
             print("Disconnecting from browser...")
-            if self._log_writer_task: self._log_writer_task.cancel()
+            if self._log_writer_task:
+                self._log_writer_task.cancel()
             await self._network_deduplicator.shutdown()
             await self.conn.disconnect()
 
     async def _interactive_loop(self):
-        print("\nCommands:\n  run [prefix] - Start or resume logging.\n  wait         - Pause logging.\n  new [prefix] - Create a new log file and start.\n  connect <port> - Connect to a different CDP port.\n  privacy      - Configure Brave WebRTC privacy settings.\n  quit         - Exit.")
+        print("\nCommands:\n  run [prefix] - Start or resume logging.\n  wait         - Pause logging.\n  new [prefix] - Create a new log file and start.\n  connect <port> - Connect to a different CDP port.\n  privacy      - Configure Brave WebRTC privacy settings.\n  tabs         - List all tracked tabs.\n  quit         - Exit.")
         while True:
             command_str = await asyncio.to_thread(input, "\n> ")
             parts = command_str.lower().strip().split()
-            if not parts: continue
+            if not parts:
+                continue
             command, args = parts[0], parts[1:]
             prefix = args[0] if args else None
 
             if command == "run":
-                if not self.log_file_path: self._start_new_log_file(prefix)
+                if not self.log_file_path:
+                    self._start_new_log_file(prefix)
                 self.is_logging = True
                 await self._ensure_listeners()
                 print(f"Logging is active. Saving to: {self.log_file_path}")
@@ -93,10 +228,30 @@ class EventDrivenMonitor:
                     await self._reconnect(int(args[0]))
             elif command == "privacy":
                 await self._configure_privacy()
+            elif command == "tabs":
+                await self._list_tabs()
             elif command == "quit":
                 break
             else:
                 print("Unknown command.")
+
+    async def _list_tabs(self):
+        """List all currently tracked tabs."""
+        if not self._page_trackers:
+            print("No tabs are currently being tracked.")
+            return
+            
+        print(f"\nCurrently tracking {len(self._page_trackers)} tab(s):")
+        for page_id, tracker in self._page_trackers.items():
+            try:
+                title = await tracker.page.title()
+                url = tracker.page.url
+                status = "Listeners attached" if tracker.listeners_attached else "No listeners"
+                print(f"  [{page_id}] {title}")
+                print(f"           URL: {url}")
+                print(f"           Status: {status}")
+            except Exception as e:
+                print(f"  [{page_id}] Error getting tab info: {e}")
 
     async def _configure_privacy(self):
         """Configure Brave WebRTC privacy settings."""
@@ -118,17 +273,15 @@ class EventDrivenMonitor:
         # Disconnect from current port
         await self.conn.disconnect()
         
-        # Reset listener state
-        self._listeners_attached = False
-        self._navigation_listener_active = False
-        self._main_frame_id = None
+        # Reset all tracking state
+        self._page_trackers.clear()
+        self._page_listener_active = False
         
         # Create new connection
         self.conn = CDPConnection(cdp_port=new_port)
         print(f"Connecting to port {new_port}...")
         
         if await self.conn.connect():
-            # Handle race condition where page might be navigating during connection
             try:
                 page_title = await self.conn.page.title()
                 page_url = self.conn.page.url
@@ -159,125 +312,95 @@ class EventDrivenMonitor:
         self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
         self.is_logging = True
         
-        if self._log_writer_task: self._log_writer_task.cancel()
+        if self._log_writer_task:
+            self._log_writer_task.cancel()
         self._log_writer_task = asyncio.create_task(self._log_writer())
-        self._log_event("SESSION_START", {"log_file": str(self.log_file_path)})
+        self._log_event("SESSION_START", {
+            "log_file": str(self.log_file_path),
+            "track_all_tabs": self.track_all_tabs
+        })
 
     async def _ensure_listeners(self):
-        if self._listeners_attached: return
-        
-        # Enable Runtime FIRST so console listener is ready
-        await self.conn.client.send('Runtime.enable')
-        self.conn.client.on('Runtime.consoleAPICalled', self._handle_console_api)
-        
-        # Enable Network monitoring
-        self.conn.client.on('Network.requestWillBeSent', self._handle_network_request)
-        await self.conn.client.send('Network.enable')
-        
-        # Enable Page domain for navigation events
-        await self.conn.client.send('Page.enable')
-        
-        # Get the main frame ID
-        frame_tree = await self.conn.client.send('Page.getFrameTree')
-        self._main_frame_id = frame_tree.get('frameTree', {}).get('frame', {}).get('id')
-        
-        # Set up navigation listener to re-inject script
-        if not self._navigation_listener_active:
-            self.conn.client.on('Page.frameNavigated', self._handle_navigation)
-            self._navigation_listener_active = True
-        
-        # Check current page URL
-        current_url = self.conn.page.url
-        if current_url.startswith('chrome://') or current_url.startswith('chrome-extension://'):
-            print(f"\nWARNING: Current page is '{current_url}'")
-            print("Chrome internal pages (chrome://) block script injection for security.")
-            print("Click detection will NOT work on this page.")
-            print("Please navigate to a regular website (e.g., https://google.com) to test click detection.\n")
-            self._listeners_attached = True
-            return
-        
-        # Inject click scanner script
-        await self._inject_scanner()
-        
-        self._listeners_attached = True
-        print("Event listeners attached and ready.")
+        """Ensure listeners are attached to the current page(s)."""
+        if self.track_all_tabs:
+            await self._setup_multi_tab_tracking()
+        else:
+            await self._setup_single_tab_tracking()
 
-    async def _inject_scanner(self):
-        """Inject the click scanner script into the current page."""
+    async def _setup_single_tab_tracking(self):
+        """Traditional single-tab tracking (original behavior)."""
+        page_id = "main"
+        if page_id not in self._page_trackers:
+            client = await self.conn.page.context.new_cdp_session(self.conn.page)
+            tracker = PageTracker(self.conn.page, client, page_id, self)
+            self._page_trackers[page_id] = tracker
+            await tracker.attach_listeners()
+        else:
+            # Listeners already attached
+            pass
+
+    async def _setup_multi_tab_tracking(self):
+        """Set up tracking for all current and future tabs."""
+        # Track all existing pages
+        context = self.conn.browser.contexts[0]
+        for idx, page in enumerate(context.pages):
+            page_id = f"tab-{idx}"
+            if page_id not in self._page_trackers:
+                try:
+                    client = await context.new_cdp_session(page)
+                    tracker = PageTracker(page, client, page_id, self)
+                    self._page_trackers[page_id] = tracker
+                    await tracker.attach_listeners()
+                    
+                    title = await page.title()
+                    print(f"[Tab {page_id}] Now tracking: {title}")
+                except Exception as e:
+                    print(f"[Tab {page_id}] Failed to set up tracking: {e}")
+        
+        # Set up listener for new pages
+        if not self._page_listener_active:
+            context.on("page", self._handle_new_page)
+            self._page_listener_active = True
+            print("Listening for new tabs and pop-ups...")
+
+    async def _handle_new_page(self, page):
+        """Handle a newly created page/tab."""
+        # Generate a unique ID for this page
+        page_id = f"tab-{len(self._page_trackers)}"
+        
+        # Wait a moment for the page to initialize
+        await asyncio.sleep(0.3)
+        
         try:
-            print("Injecting click scanner script...")
-            await self.conn.page.evaluate(self._get_click_scanner_script())
+            title = await page.title()
+            url = page.url
+            print(f"\n[Tab {page_id}] New tab/pop-up detected: {title}")
+            print(f"[Tab {page_id}] URL: {url}")
             
-            # Send a test message to verify the script is running
-            test_result = await self.conn.page.evaluate("""
-                (() => {
-                    console.log('__UI_SCANNER_TEST__');
-                    return 'Script injected successfully';
-                })()
-            """)
-            print(f"Script injection: {test_result}")
+            # Create tracker and attach listeners
+            client = await page.context.new_cdp_session(page)
+            tracker = PageTracker(page, client, page_id, self)
+            self._page_trackers[page_id] = tracker
+            
+            if self.is_logging:
+                await tracker.attach_listeners()
+                self._log_event("NEW_TAB_OPENED", {
+                    "tab_id": page_id,
+                    "url": url,
+                    "title": title
+                })
             
         except Exception as e:
-            print(f"ERROR: Failed to inject click scanner script: {e}")
-            print("Click detection will not work.")
-
-    async def _handle_navigation(self, event: dict):
-        """Re-inject the scanner script when the page navigates."""
-        frame_id = event.get('frame', {}).get('id')
-        parent_id = event.get('frame', {}).get('parentId')
-        url = event.get('frame', {}).get('url', '')
-        
-        # Only re-inject on main frame navigation (frames without a parent)
-        # or if it matches our stored main frame ID
-        is_main_frame = (parent_id is None) or (frame_id == self._main_frame_id)
-        
-        if is_main_frame:
-            print(f"\nPage navigated to: {url}")
-            
-            if not url.startswith('chrome://') and not url.startswith('chrome-extension://'):
-                # Wait a bit for the page to settle
-                await asyncio.sleep(0.5)
-                await self._inject_scanner()
-                self._log_event("PAGE_NAVIGATION", {"url": url})
+            print(f"[Tab {page_id}] Failed to set up tracking for new page: {e}")
 
     def _log_event(self, event_type: str, data: dict):
-        if not self.is_logging: return
+        if not self.is_logging:
+            return
         self._event_queue.put_nowait({
             "timestamp": datetime.now().isoformat(),
             "type": event_type,
             "data": data
         })
-    
-    def _handle_network_request(self, event: dict):
-        self._network_deduplicator.process(event)
-
-    def _handle_console_api(self, event):
-        try:
-            # Check for test message
-            if 'args' in event and len(event['args']) > 0:
-                first_arg = event['args'][0]
-                if 'value' in first_arg:
-                    value = first_arg['value']
-                    
-                    # Debug: log the test message
-                    if value == '__UI_SCANNER_TEST__':
-                        print("Click scanner script is running and console.log is working!")
-                        return
-                    
-                    # Handle actual click data
-                    if value.startswith('__UI_SCANNER_DATA__'):
-                        now = datetime.now()
-                        if now - self._last_log_time < self.MICRO_DEBOUNCE_WINDOW: return
-                        while self._ui_click_timestamps and self._ui_click_timestamps[0] < now - self.RATE_LIMIT_WINDOW:
-                            self._ui_click_timestamps.popleft()
-                        if len(self._ui_click_timestamps) >= self.RATE_LIMIT_COUNT: return
-                        self._ui_click_timestamps.append(now)
-                        self._last_log_time = now
-                        data = json.loads(value.replace('__UI_SCANNER_DATA__', ''))
-                        self._log_event('UI_CLICK', data)
-                        print(f"Click detected: {data.get('element_path', 'unknown')}")
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            pass  # Silently ignore malformed events
 
     async def _log_writer(self):
         while True:
@@ -291,7 +414,8 @@ class EventDrivenMonitor:
 
     def _get_log_path(self, prefix: str = None) -> Path:
         filename = f"{self.log_session_id}.jsonl"
-        if not prefix: return Path.home() / "Documents" / "dev_utils_logs" / filename
+        if not prefix:
+            return Path.home() / "Documents" / "dev_utils_logs" / filename
         prefix_path = Path(prefix)
         return (prefix_path / filename) if prefix.endswith('/') else prefix_path.parent / f"{prefix_path.name}_{filename}"
 
@@ -600,6 +724,7 @@ class EventDrivenMonitor:
         })();
         """
 
+
 class NetworkDeduplicator:
     """A class to identify and diff similar network requests with smart simplification and resource bundling."""
     
@@ -626,6 +751,7 @@ class NetworkDeduplicator:
     def process(self, event: dict):
         """Process a network event - either bundle it or log it immediately."""
         request_type = event.get('type', 'Other')
+        tab_id = event.get('tab_id', 'main')
         
         # Check if this should be bundled
         if request_type in self.BUNDLED_TYPES:
@@ -637,11 +763,12 @@ class NetworkDeduplicator:
             method = request_info.get('method', '')
             
             parsed_url = urlparse(url)
-            fingerprint = f"{method}::{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+            fingerprint = f"{tab_id}::{method}::{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
             if fingerprint not in self._reference_requests:
                 self._reference_requests[fingerprint] = event
                 simplified = self._simplify_event(event)
+                simplified['tab_id'] = tab_id
                 self._log_callback("NETWORK_REQUEST", simplified)
             else:
                 reference_event = self._reference_requests[fingerprint]
@@ -657,6 +784,7 @@ class NetworkDeduplicator:
                 if changes:
                     diff_data = {
                         "fingerprint": fingerprint,
+                        "tab_id": tab_id,
                         "method": method,
                         "url": self._simplify_url(url),
                         "changes": changes
@@ -688,18 +816,21 @@ class NetworkDeduplicator:
             if not self._resource_bundle:
                 return
             
-            # Group by type - just simple lists
-            by_type = defaultdict(list)
+            # Group by type and tab
+            by_tab_and_type = defaultdict(lambda: defaultdict(list))
             for event in self._resource_bundle:
                 request = event.get('request', {})
+                tab_id = event.get('tab_id', 'main')
                 resource_type = event.get('type', 'Other').lower() + 's'  # pluralize
                 url = request.get('url', '')
-                by_type[resource_type].append(self._simplify_url(url))
+                by_tab_and_type[tab_id][resource_type].append(self._simplify_url(url))
             
-            # Simple bundle format - just lists grouped by type
-            bundle_data = dict(by_type)
+            # Create bundle data
+            for tab_id, by_type in by_tab_and_type.items():
+                bundle_data = dict(by_type)
+                bundle_data['tab_id'] = tab_id
+                self._log_callback("RESOURCE_BUNDLE", bundle_data)
             
-            self._log_callback("RESOURCE_BUNDLE", bundle_data)
             self._resource_bundle.clear()
             self._bundle_timer = None
 
